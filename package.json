@@ -1,0 +1,21 @@
+{
+  "name": "teste",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@binance/connector": "^3.5.0",
+    "date-fns": "^4.1.0",
+    "date-fns-tz": "^3.2.0",
+    "mathjs": "^14.0.0",
+    "path": "^0.12.7",
+    "sqlite3": "^5.1.7",
+    "technicalindicators": "^3.1.0",
+    "ws": "^8.18.0"
+  }
+}
