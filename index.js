@@ -736,7 +736,7 @@ function analyzeTrend(symbol, currentCloseTime, params = {
             const sql = `
                 SELECT * FROM signals 
                 WHERE result IS NULL 
-                AND timestamp <= datetime('now', '-15 minutes')
+                AND timestamp <= datetime('now', '-1 minute')
             `;
 
             db.all(sql, [], (err, signals) => {
@@ -747,10 +747,11 @@ function analyzeTrend(symbol, currentCloseTime, params = {
 
                 console.log(`Verificando ${signals.length} sinais pendentes`);
                 signals.forEach(signal => {
-                    analyzeSignalResult(signal);
+                    checkSignalResult(signal);
                 });
             });
-}
+        }
+
         // Função para gerar relatório de acertividade
         function generateAccuracyReport(period = '15 minutes') {
             // Primeiro, vamos verificar se existem sinais na tabela
@@ -900,22 +901,26 @@ function analyzeTrend(symbol, currentCloseTime, params = {
         generateAccuracyReport('15 minutes');
 
         if (sinalFinal !== "NEUTRO") {
-            registerSignal({
-                timestamp: currentCloseTime,
+            const prediction = {
                 symbol: symbol,
-                type: sinalFinal,
-                entryPrice: lastClose,
-                stopLoss: stopLoss,
-                takeProfit: takeProfit,
+                signal_type: sinalFinal,
+                predicted_price: lastClose,
+                entry_price: lastClose,
+                stop_loss: stopLoss,
+                take_profit: takeProfit,
                 score: sinalFinal === "COMPRA" ? scoreCompra : scoreVenda,
                 indicators: {
                     rsi: rsi,
-                    williamsR: currentWilliamsR,
                     macd: macdLine,
-                    obv: obv[obv.length - 1],
-                    // ... outros indicadores
+                    emaShort: currentEMA10,
+                    emaLong: currentEMA20,
+                    adx: adx,
+                    volume: currentVolume,
+                    trend: trend
                 }
-            });
+            };
+
+            registerPrediction(prediction);
         }
     });
 }
@@ -1031,4 +1036,319 @@ function updateTrailingStop(signal) {
         }
     });
 }
+
+// Função para atualizar sinais ativos
+function updateActiveSignals() {
+    const sql = `
+        SELECT * FROM signals 
+        WHERE result IS NULL 
+        AND timestamp >= datetime('now', '-1 day')
+    `;
+
+    db.all(sql, [], (err, activeSignals) => {
+        if (err) {
+            console.error('Erro ao buscar sinais ativos:', err);
+            return;
+        }
+
+        console.log(`Atualizando ${activeSignals.length} sinais ativos`);
+        
+        activeSignals.forEach(signal => {
+            // Atualizar trailing stop
+            updateTrailingStop(signal);
+            
+            // Verificar se atingiu stop loss ou take profit
+            checkSignalResult(signal);
+        });
+    });
+}
+
+// Função para verificar resultado do sinal
+function checkSignalResult(signal) {
+    const sql = `
+        SELECT close, closeTime as timestamp 
+        FROM candles 
+        WHERE symbol = ? 
+        AND closeTime > ? 
+        ORDER BY closeTime ASC
+        LIMIT 20
+    `;
+
+    db.get(sql, [signal.symbol.toUpperCase(), signal.timestamp], (err, candle) => {
+        if (err) {
+            console.error('Erro ao buscar candles:', err);
+            return;
+        }
+
+        if (!candle) {
+            console.log(`Nenhuma vela encontrada para o sinal ${signal.id}`);
+            return;
+        }
+
+        console.log(`Verificando sinal ${signal.id}:
+            Preço Atual: ${candle.close}
+            Stop Loss: ${signal.stop_loss}
+            Take Profit: ${signal.take_profit}
+            Tipo: ${signal.signal_type}
+            Timestamp: ${candle.timestamp}
+        `);
+
+        const currentPrice = candle.close;
+        let result = null;
+        let profitLoss = 0;
+
+        // Lógica para COMPRA
+        if (signal.signal_type === 'COMPRA') {
+            if (currentPrice <= signal.stop_loss) {
+                result = 'STOP_LOSS';
+                profitLoss = ((signal.stop_loss - signal.entry_price) / signal.entry_price) * 100;
+                console.log(`COMPRA atingiu Stop Loss: ${currentPrice} <= ${signal.stop_loss}`);
+            } else if (currentPrice >= signal.take_profit) {
+                result = 'TAKE_PROFIT';
+                profitLoss = ((signal.take_profit - signal.entry_price) / signal.entry_price) * 100;
+                console.log(`COMPRA atingiu Take Profit: ${currentPrice} >= ${signal.take_profit}`);
+            }
+        } 
+        // Lógica para VENDA
+        else if (signal.signal_type === 'VENDA') {
+            if (currentPrice >= signal.stop_loss) {
+                result = 'STOP_LOSS';
+                profitLoss = ((signal.entry_price - signal.stop_loss) / signal.entry_price) * 100;
+                console.log(`VENDA atingiu Stop Loss: ${currentPrice} >= ${signal.stop_loss}`);
+            } else if (currentPrice <= signal.take_profit) {
+                result = 'TAKE_PROFIT';
+                profitLoss = ((signal.entry_price - signal.take_profit) / signal.entry_price) * 100;
+                console.log(`VENDA atingiu Take Profit: ${currentPrice} <= ${signal.take_profit}`);
+            }
+        }
+
+        // Verificar timeout
+        const signalAge = new Date() - new Date(signal.timestamp);
+        const MAX_SIGNAL_AGE = 24 * 60 * 60 * 1000; // 24 horas
+
+        if (!result && signalAge > MAX_SIGNAL_AGE) {
+            result = 'TIMEOUT';
+            profitLoss = ((currentPrice - signal.entry_price) / signal.entry_price) * 100;
+            if (signal.signal_type === 'VENDA') {
+                profitLoss = -profitLoss;
+            }
+            console.log(`Sinal ${signal.id} expirou por timeout`);
+        }
+
+        if (result) {
+            const updateSql = `
+                UPDATE signals 
+                SET result = ?,
+                    exit_price = ?,
+                    exit_timestamp = ?,
+                    profit_loss = ?
+                WHERE id = ?
+            `;
+
+            db.run(updateSql, [result, currentPrice, candle.timestamp, profitLoss, signal.id], (err) => {
+                if (err) {
+                    console.error('Erro ao atualizar resultado do sinal:', err);
+                } else {
+                    console.log(`Sinal ${signal.id} finalizado: ${result} (${profitLoss.toFixed(2)}%)`);
+                }
+            });
+        }
+    });
+}
+
+// Função para atualizar stop loss
+function updateSignalStopLoss(signalId, newStopLoss) {
+    const sql = `
+        UPDATE signals 
+        SET stop_loss = ? 
+        WHERE id = ?
+    `;
+
+    db.run(sql, [newStopLoss, signalId], (err) => {
+        if (err) {
+            console.error('Erro ao atualizar stop loss:', err);
+        } else {
+            console.log(`Stop loss atualizado para sinal ${signalId}: ${newStopLoss}`);
+        }
+    });
+}
+
+// Função para registrar previsão
+function registerPrediction(signal) {
+    const sql = `
+        INSERT INTO predictions (
+            timestamp,
+            symbol,
+            signal_type,
+            predicted_price,
+            entry_price,
+            stop_loss,
+            take_profit,
+            score,
+            indicators,
+            status,
+            expiration_time
+        ) VALUES (
+            datetime('now'),
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            'PENDING',
+            datetime('now', '+15 minutes')
+        )
+    `;
+
+    const indicators = {
+        rsi: signal.indicators.rsi,
+        macd: signal.indicators.macd,
+        ema: {
+            short: signal.indicators.emaShort,
+            long: signal.indicators.emaLong
+        },
+        adx: signal.indicators.adx,
+        volume: signal.indicators.volume,
+        trend: signal.indicators.trend
+    };
+
+    db.run(sql, [
+        signal.symbol,
+        signal.signal_type,
+        signal.predicted_price,
+        signal.entry_price,
+        signal.stop_loss,
+        signal.take_profit,
+        signal.score,
+        JSON.stringify(indicators)
+    ], function(err) {
+        if (err) {
+            console.error('Erro ao registrar previsão:', err);
+            return;
+        }
+        console.log(`Previsão registrada com ID ${this.lastID}`);
+    });
+}
+
+// Função para verificar previsões expiradas
+function checkPredictions() {
+    const sql = `
+        SELECT p.*, c.close as final_price
+        FROM predictions p
+        LEFT JOIN candles c ON c.symbol = p.symbol 
+        AND c.closeTime = (
+            SELECT closeTime 
+            FROM candles 
+            WHERE symbol = p.symbol 
+            AND closeTime >= p.expiration_time 
+            ORDER BY closeTime ASC 
+            LIMIT 1
+        )
+        WHERE p.status = 'PENDING'
+        AND datetime('now') >= p.expiration_time
+    `;
+
+    db.all(sql, [], (err, predictions) => {
+        if (err) {
+            console.error('Erro ao verificar previsões:', err);
+            return;
+        }
+
+        console.log(`Verificando ${predictions.length} previsões expiradas`);
+
+        predictions.forEach(prediction => {
+            let result = 'FAILED';
+            let profitLoss = 0;
+
+            if (!prediction.final_price) {
+                console.log(`Previsão ${prediction.id}: Preço final não encontrado`);
+                return;
+            }
+
+            console.log(`
+                Analisando previsão ${prediction.id}:
+                Tipo: ${prediction.signal_type}
+                Entrada: ${prediction.entry_price}
+                Stop Loss: ${prediction.stop_loss}
+                Take Profit: ${prediction.take_profit}
+                Preço Final: ${prediction.final_price}
+            `);
+
+            if (prediction.signal_type === 'COMPRA') {
+                if (prediction.final_price >= prediction.take_profit) {
+                    result = 'SUCCESS';
+                    profitLoss = ((prediction.take_profit - prediction.entry_price) / prediction.entry_price) * 100;
+                    console.log(`COMPRA bem sucedida: ${prediction.final_price} >= ${prediction.take_profit}`);
+                } else if (prediction.final_price <= prediction.stop_loss) {
+                    result = 'STOP_LOSS';
+                    profitLoss = ((prediction.stop_loss - prediction.entry_price) / prediction.entry_price) * 100;
+                    console.log(`COMPRA atingiu stop loss: ${prediction.final_price} <= ${prediction.stop_loss}`);
+                } else {
+                    profitLoss = ((prediction.final_price - prediction.entry_price) / prediction.entry_price) * 100;
+                    console.log(`COMPRA expirou: Profit/Loss = ${profitLoss.toFixed(2)}%`);
+                }
+            } else if (prediction.signal_type === 'VENDA') {
+                if (prediction.final_price <= prediction.take_profit) {
+                    result = 'SUCCESS';
+                    profitLoss = ((prediction.entry_price - prediction.take_profit) / prediction.entry_price) * 100;
+                    console.log(`VENDA bem sucedida: ${prediction.final_price} <= ${prediction.take_profit}`);
+                } else if (prediction.final_price >= prediction.stop_loss) {
+                    result = 'STOP_LOSS';
+                    profitLoss = ((prediction.entry_price - prediction.stop_loss) / prediction.entry_price) * 100;
+                    console.log(`VENDA atingiu stop loss: ${prediction.final_price} >= ${prediction.stop_loss}`);
+                } else {
+                    profitLoss = ((prediction.entry_price - prediction.final_price) / prediction.entry_price) * 100;
+                    console.log(`VENDA expirou: Profit/Loss = ${profitLoss.toFixed(2)}%`);
+                }
+            }
+
+            updatePredictionResult(prediction.id, result, profitLoss, prediction.final_price);
+        });
+    });
+}
+
+// Função para atualizar resultado da previsão
+function updatePredictionResult(id, result, profitLoss, finalPrice) {
+    const sql = `
+        UPDATE predictions 
+        SET 
+            status = 'COMPLETED',
+            result = ?,
+            profit_loss = ?,
+            final_price = ?,
+            validated_at = datetime('now')
+        WHERE id = ?
+    `;
+
+    db.run(sql, [result, profitLoss, finalPrice, id], (err) => {
+        if (err) {
+            console.error('Erro ao atualizar resultado da previsão:', err);
+        } else {
+            console.log(`Previsão ${id} atualizada: ${result} (${profitLoss.toFixed(2)}%)`);
+        }
+    });
+}
+
+// Verificar estrutura das tabelas
+db.all("PRAGMA table_info(candles)", [], (err, columns) => {
+    if (err) {
+        console.error('Erro ao verificar estrutura da tabela candles:', err);
+        return;
+    }
+    console.log('Estrutura da tabela candles:', columns);
+});
+
+db.all("PRAGMA table_info(predictions)", [], (err, columns) => {
+    if (err) {
+        console.error('Erro ao verificar estrutura da tabela predictions:', err);
+        return;
+    }
+    console.log('Estrutura da tabela predictions:', columns);
+});
+
+// Agendar verificações
+setInterval(checkPredictions, 60000); // Verificar a cada minuto
 
