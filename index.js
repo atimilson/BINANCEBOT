@@ -5,17 +5,6 @@ const { zonedTimeToUtc, format } = require('date-fns-tz');
 const { mean, std } = require('mathjs');
 const ta = require('technicalindicators'); // Para indicadores técnicos
 const fs = require('fs');
-const { Spot } = require('@binance/connector');
-const config = require('./config.js'); // Arquivo com suas credenciais
-
-// Inicializar cliente Binance
-const client = new Spot(
-    config.apiKey,
-    config.apiSecret,
-    {
-        baseURL: 'https://api.binance.com'
-    }
-);
 
 // Configurar o caminho do banco de dados SQLite
 const dbPath = path.join(__dirname, 'candles.db');
@@ -911,13 +900,13 @@ function analyzeTrend(symbol, currentCloseTime, params = {
         generateAccuracyReport('15 minutes');
 
         if (sinalFinal !== "NEUTRO") {
-            const signal = {
+            registerSignal({
                 timestamp: currentCloseTime,
                 symbol: symbol,
-                signal_type: sinalFinal,
-                entry_price: lastClose,
-                stop_loss: stopLoss,
-                take_profit: takeProfit,
+                type: sinalFinal,
+                entryPrice: lastClose,
+                stopLoss: stopLoss,
+                takeProfit: takeProfit,
                 score: sinalFinal === "COMPRA" ? scoreCompra : scoreVenda,
                 indicators: {
                     rsi: rsi,
@@ -926,15 +915,7 @@ function analyzeTrend(symbol, currentCloseTime, params = {
                     obv: obv[obv.length - 1],
                     // ... outros indicadores
                 }
-            };
-
-            // Registrar sinal
-            registerSignal(signal);
-
-            // Verificar condições de risco antes de enviar ordem
-            if (checkRiskConditions(signal)) {
-                sendOrder(signal);
-            }
+            });
         }
     });
 }
@@ -1048,125 +1029,6 @@ function updateTrailingStop(signal) {
                 updateSignalStopLoss(signal.id, newStopLoss);
             }
         }
-    });
-}
-
-// Função para enviar ordem à Binance
-async function sendOrder(signal) {
-    try {
-        const quantity = calculateOrderQuantity(signal.entry_price);
-        
-        const orderParams = {
-            symbol: signal.symbol.toUpperCase(),
-            side: signal.signal_type === 'COMPRA' ? 'BUY' : 'SELL',
-            type: 'LIMIT',
-            timeInForce: 'GTC',
-            quantity: quantity,
-            price: signal.entry_price.toFixed(2),
-            stopPrice: signal.stop_loss.toFixed(2),
-            takeProfit: signal.take_profit.toFixed(2)
-        };
-
-        // Ordem principal
-        const mainOrder = await client.newOrder(
-            orderParams.symbol,
-            orderParams.side,
-            orderParams.type,
-            {
-                quantity: orderParams.quantity,
-                price: orderParams.price,
-                timeInForce: orderParams.timeInForce
-            }
-        );
-
-        // Stop Loss
-        const stopLossOrder = await client.newOrder(
-            orderParams.symbol,
-            orderParams.side === 'BUY' ? 'SELL' : 'BUY',
-            'STOP_LOSS_LIMIT',
-            {
-                quantity: orderParams.quantity,
-                stopPrice: orderParams.stopPrice,
-                price: orderParams.stopPrice,
-                timeInForce: 'GTC'
-            }
-        );
-
-        // Take Profit
-        const takeProfitOrder = await client.newOrder(
-            orderParams.symbol,
-            orderParams.side === 'BUY' ? 'SELL' : 'BUY',
-            'LIMIT',
-            {
-                quantity: orderParams.quantity,
-                price: orderParams.takeProfit,
-                timeInForce: 'GTC'
-            }
-        );
-
-        // Registrar ordens no banco
-        registerOrders({
-            signalId: signal.id,
-            mainOrder: mainOrder.data,
-            stopLossOrder: stopLossOrder.data,
-            takeProfitOrder: takeProfitOrder.data
-        });
-
-        console.log(`Ordens enviadas com sucesso para ${signal.symbol}`);
-        return true;
-
-    } catch (error) {
-        console.error('Erro ao enviar ordem:', error);
-        return false;
-    }
-}
-
-// Função para calcular quantidade baseada no gerenciamento de risco
-function calculateOrderQuantity(entryPrice) {
-    const riskPerTrade = config.accountBalance * (config.riskPercentage / 100);
-    const quantity = (riskPerTrade / entryPrice).toFixed(6);
-    return quantity;
-}
-
-// Função para verificar condições de risco
-function checkRiskConditions(signal) {
-    // Verificar perda diária máxima
-    const dailyLossCheck = `
-        SELECT SUM(profit_loss) as daily_loss 
-        FROM signals 
-        WHERE date(timestamp) = date('now')
-        AND profit_loss < 0
-    `;
-
-    return new Promise((resolve) => {
-        db.get(dailyLossCheck, [], (err, row) => {
-            if (err) {
-                console.error('Erro ao verificar perda diária:', err);
-                resolve(false);
-                return;
-            }
-
-            const dailyLoss = Math.abs(row?.daily_loss || 0);
-            if (dailyLoss >= config.maxDailyLoss) {
-                console.log('Limite de perda diária atingido');
-                resolve(false);
-                return;
-            }
-
-            // Verificar outras condições de risco
-            const riskRewardRatio = Math.abs(
-                (signal.take_profit - signal.entry_price) / 
-                (signal.entry_price - signal.stop_loss)
-            );
-
-            if (riskRewardRatio < config.minRiskReward) {
-                console.log('RR ratio insuficiente');
-                resolve(false);
-                return;
-            }
-
-            resolve(true);
-        });
     });
 }
 
